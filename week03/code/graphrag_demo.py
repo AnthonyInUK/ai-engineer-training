@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple
 from neo4j import GraphDatabase
 from neo4j_graphrag.llm import OpenAILLM
+from dotenv import load_dotenv
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

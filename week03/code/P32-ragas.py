@@ -1,12 +1,14 @@
 # pip install langchain_community datasets ragas
 
+from ragas.metrics import answer_correctness
+from ragas import evaluate
+from datasets import Dataset
+from dotenv import load_dotenv
+from langchain_community.embeddings import DashScopeEmbeddings
+from langchain_community.llms.tongyi import Tongyi
 import os
 os.environ['GIT_PYTHON_REFRESH'] = 'quiet'
-from langchain_community.llms.tongyi import Tongyi
-from langchain_community.embeddings import DashScopeEmbeddings
-from datasets import Dataset
-from ragas import evaluate
-from ragas.metrics import answer_correctness
+load_dotenv()
 
 data_samples = {
     'question': [
