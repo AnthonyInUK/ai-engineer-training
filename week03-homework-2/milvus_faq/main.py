@@ -111,9 +111,9 @@ def init_milvus_index(data_dir: str = "./data"):
 
     # 3. Document Splitting (Semantic Splitting)
     # Using SemanticSplitterNodeParser for semantic chunking
-    # This ensures chunks are broken by meaning, not just character count
+    # buffer_size=1 adds 1 sentence before and after the chunk as context/overlap
     splitter = SemanticSplitterNodeParser(
-        buffer_size=1,
+        buffer_size=2,
         breakpoint_percentile_threshold=95,
         embed_model=embed_model
     )

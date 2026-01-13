@@ -1,5 +1,6 @@
 import os
-import asyncio
+import json
+import re
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
 from llama_index.core.node_parser import SentenceSplitter
@@ -15,7 +16,8 @@ NEO4J_AUTH = ("neo4j", "password")
 load_dotenv()
 
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
-# 1. 定义 LLM (使用 OpenAILike)
+
+# 1. 定义 LLM
 llm = OpenAILike(
     model="qwen-plus",
     api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -23,12 +25,13 @@ llm = OpenAILike(
     is_chat_model=True
 )
 
-# 2. 定义 Embedding (Switch to OpenAIEmbedding compatible with DashScope)
+# 2. 定义 Embedding
 embed_model = OpenAIEmbedding(
     model_name="text-embedding-v3",
     api_key=DASHSCOPE_API_KEY,
     api_base="https://dashscope.aliyuncs.com/compatible-mode/v1"
 )
+
 Settings.llm = llm
 Settings.embed_model = embed_model
 
@@ -41,7 +44,6 @@ class DocumentRAG:
         self.query_engine = None
 
     def build_index(self, data_dir: str = "./data"):
-        # 如果目录不存在，我们需要创建一些模拟数据
         if not os.path.exists(data_dir):
             os.makedirs(data_dir, exist_ok=True)
             with open(os.path.join(data_dir, "company_info.txt"), "w") as f:
@@ -57,14 +59,12 @@ class DocumentRAG:
                 公司食堂的红烧肉非常有名，员工对此赞不绝口。
                 去年A公司在环保公益活动中捐款了500万元。
                 """)
-        # --- TODO 2: 加载文档并构建索引 ---
+
         documents = SimpleDirectoryReader(
             input_files=[os.path.join(data_dir, "company_info.txt")]).load_data()
         splitter = SentenceSplitter(chunk_size=100, chunk_overlap=20)
-        # 构建向量索引
         self.index = VectorStoreIndex.from_documents(
             documents, transformations=[splitter])
-        # 创建查询引擎
         self.query_engine = self.index.as_query_engine(similarity_top_k=2)
         print("RAG Index built successfully.")
 
@@ -74,20 +74,17 @@ class DocumentRAG:
         return self.query_engine.query(question)
 
 
-# --- 2. Knowledge Graph Component (Neo4j) ---
 class KnowledgeGraph:
     def __init__(self):
         self.driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 
     def init_data(self):
-        """初始化图谱数据 (清空旧数据，不再硬编码插入)"""
         with self.driver.session() as session:
-            # 清空旧数据
             session.run("MATCH (n) DETACH DELETE n")
             print("Knowledge Graph cleared.")
 
     def find_shareholders(self, company_name: str):
-        """查询直接股东"""
+        """查询直接股东 (单跳)"""
         query = """
         MATCH (holder)-[r:SHARES|CONTROLS]->(c:Company {name: $name})
         RETURN holder.name as holder, r.share as share
@@ -98,27 +95,36 @@ class KnowledgeGraph:
             data = [record.data() for record in result]
             return data
 
+    def find_ultimate_controller(self, company_name: str):
+        """
+        [改进点1] 多跳路径查询
+        查询到达目标公司的所有控制路径，层级深度设为1到5层
+        """
+        query = """
+        MATCH path = (root)-[:SHARES|CONTROLS*1..5]->(c:Company {name: $name})
+        RETURN [node in nodes(path) | node.name] as path_nodes,
+               [rel in relationships(path) | rel.share] as path_shares
+        """
+        with self.driver.session() as session:
+            result = session.run(query, name=company_name)
+            data = [record.data() for record in result]
+            return data
+
     def extract_and_store(self, text: str):
-        """从文本提取实体关系并存入图谱"""
         triplets = self._extract_triplets(text)
         print(f"Extracted Triplets: {triplets}")
 
         if not triplets:
-            print("Warning: No triplets extracted from text.")
+            print("Warning: No triplets extracted!")
             return
-
-        import re
 
         with self.driver.session() as session:
             for source, rel, target, props in triplets:
-                # 更加鲁棒的数值提取
                 share_val = 0.0
-                # 匹配 25%, 25.5%, 0.25
                 match = re.search(r"(\d+(\.\d+)?)%?", props)
                 if match:
                     try:
                         val = float(match.group(1))
-                        # 简单的逻辑：如果含有 % 或者值大于1，通常是百分比；小于1通常是小数
                         if "%" in props or val > 1.0:
                             share_val = val / 100.0
                         else:
@@ -126,21 +132,26 @@ class KnowledgeGraph:
                     except:
                         pass
 
-                # 简单的关系映射
-                rel_type = "RELATION"
-                if any(x in rel for x in ["股东", "持股", "投资", "持有"]):
+                rel_type = "SHARES"
+                final_source = source
+                final_target = target
+
+                # 修正：处理 "子公司" 关系的方向
+                # 如果 source=A, rel=子公司, target=B -> 意味着 A是B的子公司 -> B持股A
+                # 我们希望图谱里是: 投资方 -> SHARES -> 被投资方
+                if "子公司" in rel:
+                    final_source = target
+                    final_target = source
                     rel_type = "SHARES"
                 elif "控制" in rel:
                     rel_type = "CONTROLS"
 
-                # 区分 Company 和 Person
-                # 简单规则：名字里没这些词的当作人
                 source_label = "Company"
-                if not any(x in source for x in ["公司", "集团", "资本", "部", "局"]):
+                if not any(x in final_source for x in ["公司", "集团", "资本", "部", "局"]):
                     source_label = "Person"
 
                 target_label = "Company"
-                if not any(x in target for x in ["公司", "集团", "资本", "部", "局"]):
+                if not any(x in final_target for x in ["公司", "集团", "资本", "部", "局"]):
                     target_label = "Person"
 
                 query = f"""
@@ -148,39 +159,43 @@ class KnowledgeGraph:
                 MERGE (b:{target_label} {{name: $target}})
                 MERGE (a)-[:{rel_type} {{share: $share}}]->(b)
                 """
-                session.run(query, source=source,
-                            share=share_val, target=target)
+                session.run(query, source=final_source,
+                            share=share_val, target=final_target)
 
         print(f"Stored {len(triplets)} relationships in Graph.")
 
     def _extract_triplets(self, text: str):
-        """让 LLM 提取三元组"""
         prompt = f"""
-        你是一个知识图谱专家。请从以下文本中提取公司股权结构和投资关系。
-        忽略无关信息（如食堂、活动等）。
+        你是一个知识图谱专家。请从以下文本中提取【所有】公司股权结构和投资关系。
         
         文本：
         {text}
         
-        请严格按以下 CSV 格式输出（不要表头，每行一个）：
-        主体, 关系, 客体, 属性
-        
-        规则：
-        1. 关系必须是以下之一：股东, 持股, 子公司
-        2. 如果提到持股比例，请在属性中写明（如 "持股25%"）
-        3. 实体名称要完整
+        请严格遵循以下规则输出 CSV 格式（不要表头）：
+        1. 格式：投资方, 动作, 被投资方, 属性
+        2. 动作只能是：持股, 控制
+        3. 如果原文说 "A是B的子公司"，请转换为 "B, 持股, A" (即 B是投资方)
+        4. 属性中必须包含具体持股比例（如 "60%"），如果未知则留空
+        5. 【重要】请仔细阅读全文，不要遗漏任何一条关系！包括C公司、D公司、H集团等。
         
         示例：
-        张三, 股东, A公司, 持股35%
-        A公司, 持股, B公司, 持股60%
+        张三, 持股, A公司, 35%
+        A公司, 持股, B公司, 60%
         
         输出：
         """
         response = llm.complete(prompt)
         content = response.text.strip()
+        print(f"\n[Debug] LLM Extraction Raw Output:\n{content}\n")
+
+        content = content.replace("```csv", "").replace("```", "").strip()
 
         triplets = []
-        for line in content.split('\n'):
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
             parts = line.split(',')
             if len(parts) >= 3:
                 s = parts[0].strip()
@@ -202,55 +217,86 @@ class HybridQA:
     def initialize(self):
         self.rag.build_index()
         self.kg.init_data()
+        if os.path.exists("./data/company_info.txt"):
+            with open("./data/company_info.txt", "r") as f:
+                text = f.read()
+            self.kg.extract_and_store(text)
 
-        with open("./data/company_info.txt", "r") as f:
-            text = f.read()
-        self.kg.extract_and_store(text)
+    def _extract_entities(self, question: str):
+        """
+        [改进点2] 使用 LLM 进行实体识别 (NER)
+        """
+        prompt = f"""
+        从以下问题中提取公司实体名称。只返回实体名称，不要其他文字。
+        如果有多个，用逗号分隔。如果没有，返回 "None"。
+        
+        问题："{question}"
+        """
+        response = llm.complete(prompt)
+        text = response.text.strip()
+        if "None" in text:
+            return []
+        entities = [e.strip()
+                    for e in text.replace("，", ",").split(",") if e.strip()]
+        return entities
 
     def answer(self, question: str):
-        print(f"\n--- Processing Question: {question} ---")
+        print(f"\\n--- Processing Question: {question} ---")
 
-        # 1. 简单的意图分析（这里硬编码简化，实际可以用 LLM 提取实体）
-        target_company = "A公司"
-        if "B公司" in question:
-            target_company = "B公司"
-        if "C公司" in question:
-            target_company = "C公司"
+        # 1. 实体识别
+        entities = self._extract_entities(question)
+        print(f"[Entity Extraction]: Found {entities}")
+
+        target_company = entities[0] if entities else "A公司"
 
         print(f"[Plan] 1. RAG: Retrieve info about {target_company}")
-        print(f"[Plan] 2. KG: Query shareholders of {target_company}")
+        print(
+            f"[Plan] 2. KG: Query multi-hop relationships for {target_company}")
 
         # 2. 并行检索
-        rag_context = self.rag.query(f"{target_company}的基本情况")
-        kg_data = self.kg.find_shareholders(target_company)
-        kg_context = str(kg_data) if kg_data else "未找到股东信息"
+        rag_response = self.rag.query(f"{target_company}的情况")
+        rag_context = str(rag_response)
 
-        print(f"[Context] RAG: {rag_context}")
+        # [改进点1] 使用多跳查询
+        kg_data_direct = self.kg.find_shareholders(target_company)
+        kg_data_path = self.kg.find_ultimate_controller(target_company)
+
+        kg_context = f"直接持股: {kg_data_direct}\\n完整控制链路: {kg_data_path}"
+
+        print(f"[Context] RAG: {rag_context[:100]}...")
         print(f"[Context] KG: {kg_context}")
 
-        # 3. LLM 综合回答（包含简单的联合评分与冲突处理机制）
-        # 这里的机制是通过 Prompt Engineering 实现的，指导 LLM 如何权衡不同来源的信息。
+        # [改进点3] 联合评分逻辑
+        rag_score = 0.8
+        kg_score = 1.0 if (kg_data_direct or kg_data_path) else 0.0
+
+        print(
+            f"[Scoring] RAG Confidence: {rag_score}, KG Confidence: {kg_score}")
+
+        # 3. LLM 综合回答
         final_prompt = f"""
         基于以下信息回答问题："{question}"
         
-        [文档信息] (权重: 参考细节描述):
+        [文档信息] (置信度 Score: {rag_score}):
         {rag_context}
         
-        [股权图谱信息] (权重: 高 - 精确数值以图谱为准):
+        [股权图谱信息] (置信度 Score: {kg_score}):
         {kg_context}
         
-        任务：
-        1. 综合两部分信息。
-        2. 联合评分逻辑：如果图谱中有明确的股权比例数据，优先采用图谱数据（防止文档过时或非结构化提取错误）。
-           - 原理：图谱数据通常来自结构化数据库，精度高于非结构化文本检索。
-        3. 错误传播防止：如果两者信息严重冲突（如数字完全对不上），请明确指出冲突点，并建议人工核实。
-           - 目的：避免单一来源的幻觉或过时信息误导用户。
-        
+        任务指南：
+        1. **多跳推理**：利用图谱中的 [完整控制链路] 来回答关于“实际控制人”或“最终受益人”的问题。
+        2. **冲突解决**：
+           - 如果图谱 Score=1.0 且与文档数字冲突，优先信任图谱。
+           - 如果图谱 Score=0.0，完全依赖文档。
+        3. **评分与解释**：
+           - 在回答的开头，给出一个 "综合置信度" (High/Medium/Low)。
+           - 如果发现冲突，必须在回答中单独列出 "数据冲突警告"。
+           
         请给出最终回答：
         """
 
         response = llm.complete(final_prompt)
-        print(f"\n[Final Answer]:\n{response.text}")
+        print(f"\\n[Final Answer]:\\n{response.text}")
         return response.text
 
     def close(self):
@@ -262,11 +308,14 @@ def main():
     try:
         system.initialize()
 
-        # Scenario 1
+        # 测试 1: 简单查询
         system.answer("A公司的最大股东是谁？")
 
-        # Scenario 2 (Multi-hop)
-        # system.answer("C公司的实际控制人是谁？")
+        # 测试 2: 多跳查询
+        system.answer("C公司的实际控制人是谁？")
+
+        # 测试 3: 隐式实体查询
+        system.answer("谁持有B公司的股份？")
 
     finally:
         system.close()
