@@ -1,10 +1,17 @@
 [project]
 name = "week05-homework"
 version = "0.1.0"
-description = "Add your description here"
+description = "Multi-agent article writing system using MCP"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
 	"python-dotenv",
-	# add your dependencies here and run `uv sync` to install them
+	"langchain>=0.3.0",
+	"langchain-openai>=0.2.0",
+	"langchain-mcp-adapters>=0.1.0",
+	"langgraph>=0.2.0",
+	"mcp>=1.0.0",
+	"fastmcp>=0.2.0",
+	"httpx>=0.27.0",
+	"rich>=13.0.0",
 ]
